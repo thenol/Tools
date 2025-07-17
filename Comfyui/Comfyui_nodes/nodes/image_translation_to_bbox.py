@@ -27,6 +27,10 @@ class ImageTranslation:
         return {
             "required": {
                 "image": ("IMAGE",),  # 图像输入 (Tensor)
+                "from_bbox": ("BBOX",),  
+                "to_bbox": ("BBOX",),    
+            },
+            "optional": {
                 "from_mask": ("MASK",),    # 从掩膜输入 (Tensor)
                 "to_mask": ("MASK",), # 平移至掩膜 (Tensor)
             }
@@ -36,12 +40,14 @@ class ImageTranslation:
     RETURN_TYPES = ("IMAGE",)  # 返回值类型为图像
     FUNCTION = "apply_mask"    # 节点主函数
 
-    def apply_mask(self, image, from_mask, to_mask):
+    def apply_mask(self, image, from_bbox=None, to_bbox=None, from_mask=None, to_mask=None):
         """
         主逻辑：平移图片，从淹没 from_mask 的bounding box位置平移至 to_mask 的bounding box位置。
 
         参数:
         - image: 输入的图像张量，形状为 [Batch, Height, Width, Channels]。
+        - from_bbox: 输入的 bounding box，格式为 [x, y, width, height]，其中 (x, y) 是左上角坐标，width 和 height 分别是宽度和高度。
+        - to_bbox: 输入的 bounding box，格式为 [x, y, width, height]，其中 (x, y) 是左上角坐标，width 和 height 分别是宽度和高度。
         - from_mask: 输入的掩膜张量，形状为 [Batch, Height, Width] 或 [Batch, 1, Height, Width]。
         - to_mask: 输入的掩膜张量，形状为 [Batch, Height, Width] 或 [Batch, 1, Height, Width]。
 
@@ -49,8 +55,22 @@ class ImageTranslation:
         返回:
         - 处理后的图像张量，形状为 [Batch, Height, Width, Channels]。
         """
-        # 确保图像和掩膜在同一个设备上（CPU/GPU）
+        assert (from_bbox is not None and to_bbox is not None) or (from_mask is not None and to_mask is not None), \
+            "Either from_bbox and to_bbox or from_mask and to_mask must be provided."
+
         device = image.device
+        # 如果提供了 bounding box，则将其转换为掩膜
+        if from_bbox is not None and to_bbox is not None:
+            from_mask = torch.zeros_like(image, dtype=torch.uint8, device=device)
+            to_mask = torch.zeros_like(image, dtype=torch.uint8, device=device)
+
+            # 将 from_bbox 和 to_bbox 转换为掩膜
+            from_x, from_y, from_w, from_h = from_bbox
+            to_x, to_y, to_w, to_h = to_bbox
+            from_mask[:, from_y:from_y + from_h, from_x:from_x + from_w] = 255
+            to_mask[:, to_y:to_y + to_h, to_x:to_x + to_w] = 255
+
+        # 确保图像和掩膜在同一个设备上（CPU/GPU）
         from_mask = from_mask.to(device)
         to_mask = to_mask.to(device)
 
@@ -59,8 +79,6 @@ class ImageTranslation:
             from_mask = from_mask.permute(0, 3, 1, 2)  # 转换为 [Batch, Channels, Height, Width]
         if len(to_mask.shape) == 4:
             to_mask = to_mask.permute(0, 3, 1, 2)  # 转换为 [Batch, Channels, Height, Width]
-        if len(image.shape) == 4:
-            image = image.permute(0, 3, 1, 2)  # 转换为 [Batch, Channels, Height, Width]
 
         # 如果掩膜缺少通道维度，则添加通道维度
         if len(from_mask.shape) == 3:  # 掩膜格式为 [Batch, Height, Width]
@@ -73,7 +91,6 @@ class ImageTranslation:
         to_mask_bbox = torch.nonzero(to_mask, as_tuple=False)
 
         if from_mask_bbox.numel() == 0 or to_mask_bbox.numel() == 0:
-            # 如果任一掩膜没有有效区域，则返回原图像
             return (image,)
 
         from_top_left = from_mask_bbox.min(dim=0)[0]
@@ -81,20 +98,13 @@ class ImageTranslation:
         to_top_left = to_mask_bbox.min(dim=0)[0]
         to_bottom_right = to_mask_bbox.max(dim=0)[0]
 
-        # 平移 from_mask bounding box 到 to_mask bounding box，使得二者中心对齐
-        from_center = (from_top_left + from_bottom_right) / 2
-        to_center = (to_top_left + to_bottom_right) / 2
-        translation_vector = to_center - from_center
-        
-        # 创建平移矩阵
-        translation_matrix = torch.tensor([[1, 0, translation_vector[0]],
-                                           [0, 1, translation_vector[1]]], device=device)
-        # 使用平移矩阵对图像进行平移
-        grid = torch.nn.functional.affine_grid(translation_matrix.unsqueeze(0), image.size(), align_corners=False)
-        image = torch.nn.functional.grid_sample(image.float(), grid, align_corners=False)
+        if len(image.shape) == 4:
+            image = image.permute(0, 3, 1, 2)  # 转换为 [Batch, Channels, Height, Width]
 
         # image 图像归一化到 [0, 1] 范围
         image = image.float() / 255.0
+        obj_image_region = image[:, :, from_top_left[2]:from_bottom_right[2], from_top_left[3]:from_bottom_right[3]]
+        transparent_bg = torch.zeros_like(image, device=device)  # 创建透明背景
 
         # 图像先平移，后沿中心缩放
         # 判断 from_mask 是否能够放入 to_mask 的 bounding box
@@ -106,50 +116,54 @@ class ImageTranslation:
                 (to_bottom_right[3] - to_top_left[3]) / (from_bottom_right[3] - from_top_left[3])
             )
 
-            # 对 image 按照 scale_factor 以图像中心进行缩放
-            image = torch.nn.functional.interpolate(
-                image, # 判断 image 图像格式
+            # 将 image 中 from_bbox 区域 按照 scale_factor 以图像中心为中心进行缩放
+            obj_image_region = torch.nn.functional.interpolate(
+                obj_image_region, # 判断 image 图像格式
                 scale_factor=scale_factor.item(),
                 mode='bilinear',
                 align_corners=False
             )
+        
+        # 计算 to_mask 的中心点
+        from_center = (from_top_left + from_bottom_right) / 2
+        to_center = (to_top_left + to_bottom_right) / 2
+        obj_b, obj_c, obj_h, obj_w = obj_image_region.shape
+
+        # 计算 obj_image_region 在 to_mask 中的放置位置
+        place_y = int(to_center[2] - obj_h / 2)
+        place_x = int(to_center[3] - obj_w / 2)
+
+        transparent_bg[:, :, place_y:place_y + obj_h, place_x:place_x + obj_w] = obj_image_region
+        image = transparent_bg
 
         # image 图像归一化回 [0, 255] 范围
         image = (image * 255.0).clamp(0, 255).to(torch.uint8)
-            
+        # 恢复图像维度为 [Batch, Height, Width, Channels]
+        image = image.permute(0, 2, 3, 1)  # 转换为 [Batch, Height, Width, Channels]
+
+        # 返回处理后的图像
         return (image,)
-
-
-# 注册自定义节点
-NODE_CLASS_MAPPINGS = {
-    "ImageTranslation": ImageTranslation
-}
-
-NODE_DISPLAY_NAME_MAPPINGS = {
-    "ImageTranslation": "Image Translation to BBox"
-}
-
 
 
 if __name__ == "__main__":
     from PIL import Image, ImageDraw
     
-    from_mask = "../../test_imgs/ComfyUI_temp_bxabi_00001_.png"
-    to_mask = "../../test_imgs/ComfyUI_01332_.png"
-    image_path = "../../test_imgs/场景4_2.png"
-    fill_device = "../../test_imgs/场景4.png"
+    # from_mask = "../../test_imgs/ComfyUI_temp_bxabi_00001_.png"
+    # to_mask = "../../test_imgs/ComfyUI_01332_.png"
+    image_path = "../../test_imgs/背景C.jpg"
+    fill_device = "../../test_imgs/C9.png"
 
     # display(Image.open(fill_device))
     image_pt = torch.from_numpy(np.array(Image.open(fill_device))).to("cpu")
-    from_mask_pt = torch.from_numpy(np.array(Image.open(from_mask))).to("cpu")
-    to_mask_pt = torch.from_numpy(np.array(Image.open(to_mask))).to("cpu")
+    # from_mask_pt = torch.from_numpy(np.array(Image.open(from_mask))).to("cpu")
+    # to_mask_pt = torch.from_numpy(np.array(Image.open(to_mask))).to("cpu")
 
     image_translation = ImageTranslation()
 
     # 格式转换
     image_pt = image_pt.unsqueeze(0)
-    to_mask_pt = to_mask_pt.unsqueeze(0)
-    from_mask_pt = from_mask_pt.unsqueeze(0)
-    print(image_pt.shape, from_mask_pt.shape, to_mask_pt.shape)
+    # to_mask_pt = to_mask_pt.unsqueeze(0)
+    # from_mask_pt = from_mask_pt.unsqueeze(0)
+    # print(image_pt.shape, from_mask_pt.shape, to_mask_pt.shape)
 
-    result = image_translation.apply_mask(image_pt, from_mask_pt, to_mask_pt)[0]
+    result = image_translation.apply_mask(image_pt, from_bbox=[771, 759, 405, 567], to_bbox=[773, 760, 401, 556], from_mask=None, to_mask=None)[0]
