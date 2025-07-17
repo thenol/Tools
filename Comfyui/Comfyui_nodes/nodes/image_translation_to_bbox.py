@@ -45,7 +45,7 @@ class ImageTranslation:
         主逻辑：平移图片，从淹没 from_mask 的bounding box位置平移至 to_mask 的bounding box位置。
 
         参数:
-        - image: 输入的图像张量，形状为 [Batch, Height, Width, Channels]。
+        - image: 输入的图像归一化之后的张量，形状为 [Batch, Height, Width, Channels]。
         - from_bbox: 输入的 bounding box，格式为 [x, y, width, height]，其中 (x, y) 是左上角坐标，width 和 height 分别是宽度和高度。
         - to_bbox: 输入的 bounding box，格式为 [x, y, width, height]，其中 (x, y) 是左上角坐标，width 和 height 分别是宽度和高度。
         - from_mask: 输入的掩膜张量，形状为 [Batch, Height, Width] 或 [Batch, 1, Height, Width]。
@@ -53,7 +53,7 @@ class ImageTranslation:
 
 
         返回:
-        - 处理后的图像张量，形状为 [Batch, Height, Width, Channels]。
+        - 处理后的图像归一化后的张量，形状为 [Batch, Height, Width, Channels]。
         """
         assert (from_bbox is not None and to_bbox is not None) or (from_mask is not None and to_mask is not None), \
             "Either from_bbox and to_bbox or from_mask and to_mask must be provided."
@@ -101,8 +101,6 @@ class ImageTranslation:
         if len(image.shape) == 4:
             image = image.permute(0, 3, 1, 2)  # 转换为 [Batch, Channels, Height, Width]
 
-        # image 图像归一化到 [0, 1] 范围
-        image = image.float() / 255.0
         obj_image_region = image[:, :, from_top_left[2]:from_bottom_right[2], from_top_left[3]:from_bottom_right[3]]
         transparent_bg = torch.zeros_like(image, device=device)  # 创建透明背景
 
@@ -136,9 +134,6 @@ class ImageTranslation:
         transparent_bg[:, :, place_y:place_y + obj_h, place_x:place_x + obj_w] = obj_image_region
         image = transparent_bg
 
-        # image 图像归一化回 [0, 255] 范围
-        image = (image * 255.0).clamp(0, 255).to(torch.uint8)
-        # 恢复图像维度为 [Batch, Height, Width, Channels]
         image = image.permute(0, 2, 3, 1)  # 转换为 [Batch, Height, Width, Channels]
 
         # 返回处理后的图像
