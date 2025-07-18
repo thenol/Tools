@@ -33,6 +33,13 @@ class ImageTranslation:
             "optional": {
                 "from_mask": ("MASK",),    # 从掩膜输入 (Tensor)
                 "to_mask": ("MASK",), # 平移至掩膜 (Tensor)
+                "scale_default": ("FLOAT", {
+                    "default": 0.0,
+                    "min": 0.0,
+                    "max": 2.0,
+                    "step": 0.001,
+                    "round": 0.0001, 
+                    "display": "number"})
             }
         }
 
@@ -40,7 +47,7 @@ class ImageTranslation:
     RETURN_TYPES = ("IMAGE",)  # 返回值类型为图像
     FUNCTION = "apply_mask"    # 节点主函数
 
-    def apply_mask(self, image, from_bbox=None, to_bbox=None, from_mask=None, to_mask=None):
+    def apply_mask(self, image, from_bbox=None, to_bbox=None, scale_default=0.997, from_mask=None, to_mask=None):
         """
         主逻辑：平移图片，从淹没 from_mask 的bounding box位置平移至 to_mask 的bounding box位置。
 
@@ -106,6 +113,7 @@ class ImageTranslation:
 
         # 图像先平移，后沿中心缩放
         # 判断 from_mask 是否能够放入 to_mask 的 bounding box
+        scale_factor = torch.tensor(1.0, device=device)
         if (to_bottom_right[2] - to_top_left[2] < from_bottom_right[2] - from_top_left[2]) or \
            (to_bottom_right[3] - to_top_left[3] < from_bottom_right[3] - from_top_left[3]):
             # 如果 from_mask 的 bounding box 大于 to_mask 的 bounding box，需要根据 from_mask 的bounding box 缩放比例
@@ -115,9 +123,13 @@ class ImageTranslation:
             )
 
             # 将 image 中 from_bbox 区域 按照 scale_factor 以图像中心为中心进行缩放
+            if scale_default is not None and scale_default != 0:
+                s_factor = scale_default
+            else:
+                s_factor = scale_factor.item()
             obj_image_region = torch.nn.functional.interpolate(
                 obj_image_region, # 判断 image 图像格式
-                scale_factor=scale_factor.item(),
+                scale_factor=s_factor,
                 mode='bilinear',
                 align_corners=False
             )
@@ -130,6 +142,11 @@ class ImageTranslation:
         # 计算 obj_image_region 在 to_mask 中的放置位置
         place_y = int(to_center[2] - obj_h / 2)
         place_x = int(to_center[3] - obj_w / 2)
+
+        print(f"original image bbox:{from_bbox}, from_box center (w, h) is {from_center[2:].int().tolist()[::-1]}")
+        print(f"reference image bbox:{to_bbox}, to_box center (w, h) is {to_center[2:].int().tolist()[::-1]}")
+        print(f"translated image bbox:{[place_x, place_y, obj_h, obj_w]}, translated image center (w, h) is {[place_x + obj_w / 2, place_y + obj_h / 2]}")
+        print(f"scale_factor is {scale_factor.item()}, default factor is {scale_default},  use factor {s_factor}")
 
         transparent_bg[:, :, place_y:place_y + obj_h, place_x:place_x + obj_w] = obj_image_region
         image = transparent_bg
