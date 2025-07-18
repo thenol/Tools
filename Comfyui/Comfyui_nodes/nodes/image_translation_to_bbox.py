@@ -114,6 +114,7 @@ class ImageTranslation:
         # 图像先平移，后沿中心缩放
         # 判断 from_mask 是否能够放入 to_mask 的 bounding box
         scale_factor = torch.tensor(1.0, device=device)
+        s_factor = scale_factor.item()
         if (to_bottom_right[2] - to_top_left[2] < from_bottom_right[2] - from_top_left[2]) or \
            (to_bottom_right[3] - to_top_left[3] < from_bottom_right[3] - from_top_left[3]):
             # 如果 from_mask 的 bounding box 大于 to_mask 的 bounding box，需要根据 from_mask 的bounding box 缩放比例
